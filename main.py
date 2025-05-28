@@ -2,6 +2,7 @@ import os
 import shutil
 import uuid
 import asyncio
+import subprocess
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 from contextlib import asynccontextmanager
@@ -9,15 +10,21 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from git import Repo
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-# Load Gemini API key from .env
+# Load environment variables from .env
 load_dotenv()
+
+# Load API keys from .env
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY not set in .env file.")
+
+if not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_TOKEN not set in .env file.")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -154,6 +161,37 @@ def get_session_dependency(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found or expired")
     return session
 
+def clone_repository(github_url: str, repo_dir: str):
+    """Clone repository using git clone command with authentication"""
+    try:
+        # Parse the GitHub URL to insert the token
+        if github_url.startswith("https://github.com/"):
+            # Replace https://github.com/ with https://token@github.com/
+            authenticated_url = github_url.replace("https://github.com/", f"https://{GITHUB_TOKEN}@github.com/")
+        else:
+            # If it's already an authenticated URL or different format, use as is
+            authenticated_url = github_url
+        
+        # Use subprocess to run git clone
+        result = subprocess.run(
+            ["git", "clone", authenticated_url, repo_dir],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        if result.returncode != 0:
+            raise Exception(f"Git clone failed: {result.stderr}")
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        raise Exception("Repository cloning timed out (5 minutes)")
+    except FileNotFoundError:
+        raise Exception("Git command not found. Please ensure Git is installed.")
+    except Exception as e:
+        raise Exception(f"Error cloning repository: {str(e)}")
+
 # API Endpoints
 @app.post("/create-session", response_model=SessionResponse)
 def create_session():
@@ -179,8 +217,8 @@ def analyze_repo(
         shutil.rmtree(repo_dir)
     
     try:
-        # Clone repository
-        Repo.clone_from(req.github_url, repo_dir)
+        # Clone repository using git clone command
+        clone_repository(req.github_url, repo_dir)
         session["repo_analyzed"] = True
         
         return AnalyzeResponse(
