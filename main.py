@@ -1,10 +1,10 @@
 import os
-import shutil
 import uuid
 import asyncio
-import subprocess
+import requests
+import base64
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
@@ -33,22 +33,16 @@ class SessionManager:
     def __init__(self, session_timeout_minutes: int = 30):
         self.sessions: Dict[str, dict] = {}
         self.session_timeout = timedelta(minutes=session_timeout_minutes)
-        self.base_repo_dir = "repos"
-        
-        # Create base directory if it doesn't exist
-        if not os.path.exists(self.base_repo_dir):
-            os.makedirs(self.base_repo_dir)
     
     def create_session(self) -> str:
         """Create a new session and return session ID"""
         session_id = str(uuid.uuid4())
-        repo_dir = os.path.join(self.base_repo_dir, f"repo_{session_id}")
         
         self.sessions[session_id] = {
             "created_at": datetime.now(),
             "last_accessed": datetime.now(),
-            "repo_dir": repo_dir,
-            "repo_analyzed": False
+            "repo_analyzed": False,
+            "repo_content": {}
         }
         
         return session_id
@@ -63,7 +57,7 @@ class SessionManager:
         return session
     
     def cleanup_expired_sessions(self):
-        """Remove expired sessions and their directories"""
+        """Remove expired sessions"""
         current_time = datetime.now()
         expired_sessions = []
         
@@ -72,24 +66,13 @@ class SessionManager:
                 expired_sessions.append(session_id)
         
         for session_id in expired_sessions:
-            self._remove_session(session_id)
-    
-    def _remove_session(self, session_id: str):
-        """Remove session and cleanup its directory"""
-        if session_id in self.sessions:
-            repo_dir = self.sessions[session_id]["repo_dir"]
-            if os.path.exists(repo_dir):
-                try:
-                    shutil.rmtree(repo_dir)
-                except Exception as e:
-                    print(f"Error removing directory {repo_dir}: {e}")
-            
             del self.sessions[session_id]
             print(f"Session {session_id} cleaned up")
     
     def force_cleanup_session(self, session_id: str):
         """Manually cleanup a specific session"""
-        self._remove_session(session_id)
+        if session_id in self.sessions:
+            del self.sessions[session_id]
 
 # Global session manager
 session_manager = SessionManager()
@@ -161,36 +144,111 @@ def get_session_dependency(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found or expired")
     return session
 
-def clone_repository(github_url: str, repo_dir: str):
-    """Clone repository using git clone command with authentication"""
-    try:
-        # Parse the GitHub URL to insert the token
-        if github_url.startswith("https://github.com/"):
-            # Replace https://github.com/ with https://token@github.com/
-            authenticated_url = github_url.replace("https://github.com/", f"https://{GITHUB_TOKEN}@github.com/")
-        else:
-            # If it's already an authenticated URL or different format, use as is
-            authenticated_url = github_url
+def parse_github_url(github_url: str) -> tuple:
+    """Extract owner and repo name from GitHub URL"""
+    # Remove .git suffix if present
+    if github_url.endswith('.git'):
+        github_url = github_url[:-4]
+    
+    # Handle different GitHub URL formats
+    if 'github.com/' in github_url:
+        parts = github_url.split('github.com/')[-1].split('/')
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+    
+    raise ValueError("Invalid GitHub URL format")
+
+def get_repo_contents_via_api(owner: str, repo: str, path: str = "") -> List[dict]:
+    """Get repository contents using GitHub API"""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"GitHub API error: {response.status_code} - {response.text}")
+    
+    return response.json()
+
+def get_file_content(owner: str, repo: str, path: str) -> str:
+    """Get file content using GitHub API"""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return ""
+    
+    file_data = response.json()
+    if file_data.get('encoding') == 'base64':
+        content = base64.b64decode(file_data['content']).decode('utf-8', errors='ignore')
+        return content
+    
+    return ""
+
+def fetch_code_files(owner: str, repo: str, max_chars: int = 50000) -> str:
+    """Fetch code files from repository using GitHub API"""
+    code_parts = []
+    total_chars = 0
+    
+    # Common code file extensions
+    code_extensions = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rb', '.php', 
+        '.cpp', '.c', '.cs', '.h', '.hpp', '.rs', '.kt', '.swift', '.scala',
+        '.html', '.css', '.vue', '.svelte', '.dart', '.r', '.m', '.sh', '.json'
+    }
+    
+    # Directories to skip
+    skip_dirs = {
+        'node_modules', '.git', '__pycache__', '.venv', 'venv', 
+        'build', 'dist', 'target', '.idea', '.vscode', '.next', 'out'
+    }
+    
+    def process_directory(path: str = ""):
+        nonlocal total_chars
         
-        # Use subprocess to run git clone
-        result = subprocess.run(
-            ["git", "clone", authenticated_url, repo_dir],
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        
-        if result.returncode != 0:
-            raise Exception(f"Git clone failed: {result.stderr}")
-        
-        return True
-        
-    except subprocess.TimeoutExpired:
-        raise Exception("Repository cloning timed out (5 minutes)")
-    except FileNotFoundError:
-        raise Exception("Git command not found. Please ensure Git is installed.")
-    except Exception as e:
-        raise Exception(f"Error cloning repository: {str(e)}")
+        try:
+            contents = get_repo_contents_via_api(owner, repo, path)
+            
+            for item in contents:
+                if total_chars >= max_chars:
+                    break
+                
+                if item['type'] == 'dir':
+                    if item['name'] not in skip_dirs:
+                        process_directory(item['path'])
+                elif item['type'] == 'file':
+                    file_ext = os.path.splitext(item['name'])[1].lower()
+                    
+                    if file_ext in code_extensions:
+                        try:
+                            content = get_file_content(owner, repo, item['path'])
+                            if content:
+                                file_content = f"\n\n# File: {item['path']}\n{content}"
+                                
+                                # Check if adding this file would exceed limit
+                                if total_chars + len(file_content) > max_chars:
+                                    remaining_chars = max_chars - total_chars
+                                    if remaining_chars > 100:
+                                        file_content = file_content[:remaining_chars] + "\n... [truncated]"
+                                        code_parts.append(file_content)
+                                    break
+                                
+                                code_parts.append(file_content)
+                                total_chars += len(file_content)
+                        except Exception as e:
+                            print(f"Error fetching file {item['path']}: {e}")
+                            continue
+        except Exception as e:
+            print(f"Error processing directory {path}: {e}")
+    
+    process_directory()
+    return "\n".join(code_parts)
 
 # API Endpoints
 @app.post("/create-session", response_model=SessionResponse)
@@ -209,73 +267,34 @@ def analyze_repo(
     background_tasks: BackgroundTasks,
     session: dict = Depends(get_session_dependency)
 ):
-    """Download and analyze a GitHub repository for a specific session"""
-    repo_dir = session["repo_dir"]
-    
-    # Remove previous repo if exists
-    if os.path.exists(repo_dir):
-        shutil.rmtree(repo_dir)
-    
+    """Analyze a GitHub repository using GitHub API"""
     try:
-        # Clone repository using git clone command
-        clone_repository(req.github_url, repo_dir)
+        # Parse GitHub URL
+        owner, repo = parse_github_url(req.github_url)
+        
+        # Fetch repository content using GitHub API
+        repo_content = fetch_code_files(owner, repo)
+        
+        if not repo_content.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="No code files found in the repository or repository is empty."
+            )
+        
+        # Store content in session
+        session["repo_content"] = repo_content
         session["repo_analyzed"] = True
+        session["owner"] = owner
+        session["repo_name"] = repo
         
         return AnalyzeResponse(
-            status="Repository downloaded and ready for Q&A",
+            status="Repository analyzed and ready for Q&A",
             session_id=session_id
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid GitHub URL: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Repo clone failed: {str(e)}")
-
-def read_all_code_files(directory: str, max_chars: int = 50000) -> str:
-    """Read all code files from directory with improved file handling"""
-    code_parts = []
-    total_chars = 0
-    
-    # Common code file extensions
-    code_extensions = {
-        '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rb', '.php', 
-        '.cpp', '.c', '.cs', '.h', '.hpp', '.rs', '.kt', '.swift', '.scala',
-        '.html', '.css', '.vue', '.svelte', '.dart', '.r', '.m', '.sh'
-    }
-    
-    # Walk through directory
-    for root, dirs, files in os.walk(directory):
-        # Skip common non-code directories
-        dirs[:] = [d for d in dirs if d not in {
-            'node_modules', '.git', '__pycache__', '.venv', 'venv', 
-            'build', 'dist', 'target', '.idea', '.vscode'
-        }]
-        
-        for file in files:
-            file_path = os.path.join(root, file)
-            file_ext = os.path.splitext(file)[1].lower()
-            
-            if file_ext in code_extensions:
-                try:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                        
-                    # Add file header and content
-                    file_content = f"\n\n# File: {os.path.relpath(file_path, directory)}\n{content}"
-                    
-                    # Check if adding this file would exceed limit
-                    if total_chars + len(file_content) > max_chars:
-                        remaining_chars = max_chars - total_chars
-                        if remaining_chars > 100:  # Only add if we have meaningful space left
-                            file_content = file_content[:remaining_chars] + "\n... [truncated]"
-                            code_parts.append(file_content)
-                        break
-                    
-                    code_parts.append(file_content)
-                    total_chars += len(file_content)
-                    
-                except Exception as e:
-                    print(f"Error reading file {file_path}: {e}")
-                    continue
-    
-    return "\n".join(code_parts)
+        raise HTTPException(status_code=400, detail=f"Repository analysis failed: {str(e)}")
 
 @app.post("/ask/{session_id}", response_model=QAResponse)
 def ask_question(
@@ -290,28 +309,21 @@ def ask_question(
             detail="No repository analyzed for this session. Use /analyze endpoint first."
         )
     
-    repo_dir = session["repo_dir"]
-    if not os.path.exists(repo_dir):
+    repo_content = session.get("repo_content", "")
+    if not repo_content.strip():
         raise HTTPException(
             status_code=400, 
-            detail="Repository directory not found. Please re-analyze the repository."
+            detail="No repository content found. Please re-analyze the repository."
         )
     
     try:
-        # Read code files
-        code_context = read_all_code_files(repo_dir)
-        
-        if not code_context.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="No code files found in the repository or all files are empty."
-            )
-        
         # Create prompt for Gemini
         prompt = f"""You are a code analysis expert. Analyze the following codebase and answer the user's question accurately and comprehensively.
 
+REPOSITORY: {session.get('owner', 'Unknown')}/{session.get('repo_name', 'Unknown')}
+
 CODEBASE:
-{code_context}
+{repo_content}
 
 USER QUESTION: {req.question}
 
@@ -343,7 +355,8 @@ def get_session_status(
         "created_at": session["created_at"].isoformat(),
         "last_accessed": session["last_accessed"].isoformat(),
         "repo_analyzed": session.get("repo_analyzed", False),
-        "repo_dir": session["repo_dir"]
+        "owner": session.get("owner", None),
+        "repo_name": session.get("repo_name", None)
     }
 
 @app.delete("/session/{session_id}")
