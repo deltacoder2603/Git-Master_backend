@@ -330,7 +330,7 @@ USER QUESTION: {req.question}
 Please provide a detailed and helpful answer based on the codebase provided."""
         
         # Generate response using Gemini
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         response = model.generate_content(prompt)
         
         return QAResponse(
