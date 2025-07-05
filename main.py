@@ -18,7 +18,7 @@ load_dotenv()
 
 # Load API keys from .env
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_TOKEN = "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"
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY not set in .env file.")
