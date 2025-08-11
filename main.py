@@ -168,11 +168,21 @@ def get_file_content(owner: str, repo: str, path: str) -> str:
         return base64.b64decode(file_data['content']).decode('utf-8', errors='ignore')
     return ""
 
-def fetch_code_files(owner: str, repo: str, max_chars: int = 50000) -> str:
-    code_parts = []
+def fetch_all_files(owner: str, repo: str, max_chars: int = 50000) -> str:
+    file_parts = []
     total_chars = 0
-    code_extensions = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rb', '.php', '.cpp', '.c', '.cs', '.h', '.hpp', '.rs', '.kt', '.swift', '.scala', '.html', '.css', '.vue', '.svelte', '.dart', '.r', '.m', '.sh', '.json'}
-    skip_dirs = {'node_modules', '.git', '__pycache__', '.venv', 'venv', 'build', 'dist', 'target', '.idea', '.vscode', '.next', 'out'}
+    
+    # Binary file extensions to skip
+    binary_exts = {
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
+        '.pdf', '.exe', '.dll', '.so', '.dylib', '.zip', '.tar', '.gz', '.7z', '.rar',
+        '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.mkv', '.avi', '.mov'
+    }
+    
+    skip_dirs = {
+        'node_modules', '.git', '__pycache__', '.venv', 'venv',
+        'build', 'dist', 'target', '.idea', '.vscode', '.next', 'out'
+    }
 
     def process_directory(path: str = ""):
         nonlocal total_chars
@@ -186,25 +196,27 @@ def fetch_code_files(owner: str, repo: str, max_chars: int = 50000) -> str:
                         process_directory(item['path'])
                 elif item['type'] == 'file':
                     file_ext = os.path.splitext(item['name'])[1].lower()
-                    if file_ext in code_extensions:
-                        content = get_file_content(owner, repo, item['path'])
-                        if content:
-                            file_content = f"\n\n# File: {item['path']}\n{content}"
-                            if total_chars + len(file_content) > max_chars:
-                                remaining = max_chars - total_chars
-                                if remaining > 100:
-                                    file_content = file_content[:remaining] + "\n... [truncated]"
-                                    code_parts.append(file_content)
-                                break
-                            code_parts.append(file_content)
-                            total_chars += len(file_content)
+                    if file_ext in binary_exts:
+                        continue  # Skip binary files
+                    
+                    content = get_file_content(owner, repo, item['path'])
+                    if content:
+                        file_content = f"\n\n# File: {item['path']}\n{content}"
+                        if total_chars + len(file_content) > max_chars:
+                            remaining = max_chars - total_chars
+                            if remaining > 100:
+                                file_content = file_content[:remaining] + "\n... [truncated]"
+                                file_parts.append(file_content)
+                            break
+                        file_parts.append(file_content)
+                        total_chars += len(file_content)
         except Exception as e:
             print(f"[ERROR] Directory {path}: {e}")
 
     default_branch = get_default_branch(owner, repo)
     print(f"[INFO] Default branch: {default_branch}")
     process_directory()
-    return "\n".join(code_parts)
+    return "\n".join(file_parts)
 
 @app.post("/create-session", response_model=SessionResponse)
 def create_session():
@@ -215,7 +227,7 @@ def create_session():
 def analyze_repo(session_id: str, req: RepoRequest, background_tasks: BackgroundTasks, session: dict = Depends(get_session_dependency)):
     try:
         owner, repo = parse_github_url(req.github_url)
-        repo_content = fetch_code_files(owner, repo)
+        repo_content = fetch_all_files(owner, repo)
         if not repo_content.strip():
             raise HTTPException(status_code=400, detail="No code files found in the repository or repository is empty.")
         session["repo_content"] = repo_content
