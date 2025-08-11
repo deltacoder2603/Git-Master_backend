@@ -18,7 +18,7 @@ load_dotenv()
 
 # Load API keys from .env
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or "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"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or "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"
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY not set in .env file.")
@@ -121,13 +121,16 @@ def get_session_dependency(session_id: str):
     return session
 
 def parse_github_url(github_url: str) -> tuple:
+    print(f"[DEBUG] Parsing GitHub URL: {github_url}")
     if github_url.endswith('.git'):
         github_url = github_url[:-4]
     if 'github.com/' in github_url:
         parts = github_url.split('github.com/')[-1].split('/')
         if len(parts) >= 2:
-            return parts[0], parts[1]
-    raise ValueError("Invalid GitHub URL format")
+            owner, repo = parts[0], parts[1]
+            print(f"[DEBUG] Parsed owner: {owner}, repo: {repo}")
+            return owner, repo
+    raise ValueError(f"Invalid GitHub URL format: {github_url}")
 
 def get_default_branch(owner: str, repo: str) -> str:
     url = f"https://api.github.com/repos/{owner}/{repo}"
@@ -135,11 +138,28 @@ def get_default_branch(owner: str, repo: str) -> str:
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json"
     }
+    print(f"[DEBUG] Getting default branch for {owner}/{repo}")
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
-        return response.json().get("default_branch", "main")
+        default_branch = response.json().get("default_branch", "main")
+        print(f"[DEBUG] Default branch: {default_branch}")
+        return default_branch
     print(f"[ERROR] Failed to get default branch: {response.status_code} - {response.text}")
     return "main"
+
+def check_repo_exists(owner: str, repo: str) -> bool:
+    """Check if repository exists and is accessible"""
+    url = f"https://api.github.com/repos/{owner}/{repo}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    response = requests.get(url, headers=headers)
+    print(f"[DEBUG] Repository check: {response.status_code}")
+    if response.status_code != 200:
+        print(f"[ERROR] Repository check failed: {response.text}")
+        return False
+    return True
 
 def get_repo_contents_via_api(owner: str, repo: str, path: str = "") -> List[dict]:
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
@@ -150,9 +170,14 @@ def get_repo_contents_via_api(owner: str, repo: str, path: str = "") -> List[dic
     response = requests.get(url, headers=headers)
     print(f"[DEBUG] Fetching: {url} - Status: {response.status_code}")
     if response.status_code != 200:
-        print(f"[DEBUG] GitHub API Error: {response.text}")
+        print(f"[ERROR] GitHub API Error: {response.text}")
         raise Exception(f"GitHub API error: {response.status_code} - {response.text}")
-    return response.json()
+    
+    contents = response.json()
+    print(f"[DEBUG] Found {len(contents)} items in path '{path}'")
+    for item in contents[:5]:  # Log first 5 items
+        print(f"[DEBUG]   - {item['type']}: {item['name']}")
+    return contents
 
 def get_file_content(owner: str, repo: str, path: str) -> str:
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
@@ -162,61 +187,147 @@ def get_file_content(owner: str, repo: str, path: str) -> str:
     }
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
+        print(f"[ERROR] Failed to get file content for {path}: {response.status_code}")
         return ""
+    
     file_data = response.json()
     if file_data.get('encoding') == 'base64':
-        return base64.b64decode(file_data['content']).decode('utf-8', errors='ignore')
+        try:
+            content = base64.b64decode(file_data['content']).decode('utf-8', errors='ignore')
+            print(f"[DEBUG] Successfully read file {path} ({len(content)} chars)")
+            return content
+        except Exception as e:
+            print(f"[ERROR] Failed to decode file {path}: {e}")
+            return ""
     return ""
 
-def fetch_all_files(owner: str, repo: str, max_chars: int = 50000) -> str:
+def is_text_file(filename: str) -> bool:
+    """Check if file is likely to be a text file"""
+    text_extensions = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h', '.hpp',
+        '.cs', '.php', '.rb', '.go', '.rs', '.swift', '.kt', '.scala', '.sh', '.bash',
+        '.html', '.htm', '.css', '.scss', '.sass', '.less', '.xml', '.json', '.yaml', '.yml',
+        '.md', '.txt', '.rst', '.sql', '.r', '.m', '.pl', '.lua', '.vim', '.dart',
+        '.coffee', '.clj', '.ex', '.exs', '.elm', '.hs', '.ml', '.fs', '.fsx', '.vb',
+        '.dockerfile', '.makefile', '.cmake', '.gradle', '.sbt', '.toml', '.ini', '.cfg'
+    }
+    
+    # Files without extensions that are usually text
+    common_text_files = {
+        'readme', 'license', 'dockerfile', 'makefile', 'rakefile', 'gemfile',
+        'procfile', 'vagrantfile', 'requirements', 'setup', 'changelog', 'authors',
+        'contributors', 'copying', 'install', 'news', 'todo', 'version'
+    }
+    
+    file_ext = os.path.splitext(filename)[1].lower()
+    base_name = os.path.splitext(filename)[0].lower()
+    
+    return file_ext in text_extensions or base_name in common_text_files
+
+def fetch_all_files(owner: str, repo: str, max_chars: int = 100000) -> str:
+    print(f"[DEBUG] Starting to fetch files from {owner}/{repo}")
+    
+    # First, check if repo exists
+    if not check_repo_exists(owner, repo):
+        raise Exception(f"Repository {owner}/{repo} not found or not accessible")
+    
     file_parts = []
     total_chars = 0
+    files_processed = 0
     
     # Binary file extensions to skip
     binary_exts = {
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg',
         '.pdf', '.exe', '.dll', '.so', '.dylib', '.zip', '.tar', '.gz', '.7z', '.rar',
-        '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.mkv', '.avi', '.mov'
+        '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.mkv', '.avi', '.mov', '.woff', '.woff2',
+        '.ttf', '.eot', '.otf', '.class', '.jar', '.war', '.pyc', '.pyo', '.pyd',
+        '.o', '.obj', '.lib', '.a', '.db', '.sqlite', '.sqlite3'
     }
     
     skip_dirs = {
-        'node_modules', '.git', '__pycache__', '.venv', 'venv',
-        'build', 'dist', 'target', '.idea', '.vscode', '.next', 'out'
+        'node_modules', '.git', '__pycache__', '.venv', 'venv', 'env',
+        'build', 'dist', 'target', '.idea', '.vscode', '.next', 'out',
+        'coverage', '.coverage', '.pytest_cache', '.mypy_cache', '.tox',
+        'vendor', 'deps', 'tmp', 'temp', 'logs', 'log'
     }
 
     def process_directory(path: str = ""):
-        nonlocal total_chars
+        nonlocal total_chars, files_processed
         try:
             contents = get_repo_contents_via_api(owner, repo, path)
+            
             for item in contents:
                 if total_chars >= max_chars:
+                    print(f"[DEBUG] Reached max_chars limit ({max_chars})")
                     break
+                    
                 if item['type'] == 'dir':
-                    if item['name'] not in skip_dirs:
+                    if item['name'] not in skip_dirs and not item['name'].startswith('.'):
+                        print(f"[DEBUG] Processing directory: {item['path']}")
                         process_directory(item['path'])
+                        
                 elif item['type'] == 'file':
                     file_ext = os.path.splitext(item['name'])[1].lower()
-                    if file_ext in binary_exts:
-                        continue  # Skip binary files
                     
+                    # Skip binary files
+                    if file_ext in binary_exts:
+                        print(f"[DEBUG] Skipping binary file: {item['name']}")
+                        continue
+                    
+                    # Only process text files
+                    if not is_text_file(item['name']):
+                        print(f"[DEBUG] Skipping non-text file: {item['name']}")
+                        continue
+                    
+                    print(f"[DEBUG] Processing file: {item['path']}")
                     content = get_file_content(owner, repo, item['path'])
-                    if content:
+                    
+                    if content.strip():  # Only include files with content
                         file_content = f"\n\n# File: {item['path']}\n{content}"
-                        if total_chars + len(file_content) > max_chars:
+                        content_length = len(file_content)
+                        
+                        if total_chars + content_length > max_chars:
                             remaining = max_chars - total_chars
-                            if remaining > 100:
-                                file_content = file_content[:remaining] + "\n... [truncated]"
-                                file_parts.append(file_content)
+                            if remaining > 200:  # Only add if we have reasonable space left
+                                truncated_content = file_content[:remaining] + "\n... [truncated]"
+                                file_parts.append(truncated_content)
+                                total_chars += len(truncated_content)
                             break
+                        
                         file_parts.append(file_content)
-                        total_chars += len(file_content)
+                        total_chars += content_length
+                        files_processed += 1
+                        print(f"[DEBUG] Added file {item['path']} ({content_length} chars, total: {total_chars})")
+                    else:
+                        print(f"[DEBUG] Skipping empty file: {item['path']}")
+                        
         except Exception as e:
-            print(f"[ERROR] Directory {path}: {e}")
+            print(f"[ERROR] Error processing directory '{path}': {e}")
+            # Don't re-raise, continue with other directories
 
-    default_branch = get_default_branch(owner, repo)
-    print(f"[INFO] Default branch: {default_branch}")
-    process_directory()
-    return "\n".join(file_parts)
+    try:
+        default_branch = get_default_branch(owner, repo)
+        print(f"[INFO] Default branch: {default_branch}")
+        process_directory()
+        
+        print(f"[INFO] Processed {files_processed} files, total {total_chars} characters")
+        
+        if not file_parts:
+            print(f"[ERROR] No text files found in repository")
+            # Let's try to get a directory listing to see what's there
+            try:
+                root_contents = get_repo_contents_via_api(owner, repo)
+                print(f"[DEBUG] Root directory contains:")
+                for item in root_contents:
+                    print(f"[DEBUG]   - {item['type']}: {item['name']}")
+            except Exception as e:
+                print(f"[ERROR] Could not even list root directory: {e}")
+        
+        return "\n".join(file_parts)
+        
+    except Exception as e:
+        print(f"[ERROR] Fatal error in fetch_all_files: {e}")
+        raise
 
 @app.post("/create-session", response_model=SessionResponse)
 def create_session():
@@ -226,19 +337,33 @@ def create_session():
 @app.post("/analyze/{session_id}", response_model=AnalyzeResponse)
 def analyze_repo(session_id: str, req: RepoRequest, background_tasks: BackgroundTasks, session: dict = Depends(get_session_dependency)):
     try:
+        print(f"[INFO] Starting analysis for session {session_id}")
         owner, repo = parse_github_url(req.github_url)
+        
+        print(f"[INFO] Fetching repository content for {owner}/{repo}")
         repo_content = fetch_all_files(owner, repo)
+        
         if not repo_content.strip():
-            raise HTTPException(status_code=400, detail="No code files found in the repository or repository is empty.")
+            error_msg = f"No code files found in the repository {owner}/{repo} or repository is empty."
+            print(f"[ERROR] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
+        
         session["repo_content"] = repo_content
         session["repo_analyzed"] = True
         session["owner"] = owner
         session["repo_name"] = repo
-        return AnalyzeResponse(status="Repository analyzed and ready for Q&A", session_id=session_id)
+        
+        print(f"[INFO] Successfully analyzed repository {owner}/{repo} ({len(repo_content)} chars)")
+        return AnalyzeResponse(status=f"Repository {owner}/{repo} analyzed and ready for Q&A", session_id=session_id)
+        
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid GitHub URL: {str(e)}")
+        error_msg = f"Invalid GitHub URL: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        raise HTTPException(status_code=400, detail=error_msg)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Repository analysis failed: {str(e)}")
+        error_msg = f"Repository analysis failed: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        raise HTTPException(status_code=400, detail=error_msg)
 
 @app.post("/ask/{session_id}", response_model=QAResponse)
 def ask_question(session_id: str, req: QARequest, session: dict = Depends(get_session_dependency)):
@@ -280,6 +405,35 @@ def cleanup_session(session_id: str):
     session_manager.force_cleanup_session(session_id)
     return {"message": f"Session {session_id} cleaned up successfully"}
 
+# Add a debug endpoint to test repository access
+@app.post("/debug-repo")
+def debug_repo_access(req: RepoRequest):
+    """Debug endpoint to test repository access without creating a session"""
+    try:
+        owner, repo = parse_github_url(req.github_url)
+        
+        # Check if repo exists
+        if not check_repo_exists(owner, repo):
+            return {"error": f"Repository {owner}/{repo} not found or not accessible"}
+        
+        # Get root contents
+        try:
+            root_contents = get_repo_contents_via_api(owner, repo)
+            contents_summary = [{"name": item["name"], "type": item["type"]} for item in root_contents[:10]]
+        except Exception as e:
+            return {"error": f"Could not list repository contents: {str(e)}"}
+        
+        return {
+            "owner": owner,
+            "repo": repo,
+            "status": "accessible",
+            "root_contents": contents_summary,
+            "total_items": len(root_contents) if 'root_contents' in locals() else 0
+        }
+        
+    except Exception as e:
+        return {"error": f"Debug failed: {str(e)}"}
+
 @app.get("/health")
 def health_check():
     return {
@@ -299,6 +453,7 @@ def root():
             "POST /ask/{session_id}",
             "GET /session-status/{session_id}",
             "DELETE /session/{session_id}",
+            "POST /debug-repo",
             "GET /health"
         ]
     }
